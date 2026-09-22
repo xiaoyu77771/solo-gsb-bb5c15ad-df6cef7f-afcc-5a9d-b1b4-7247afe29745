@@ -12,6 +12,14 @@ from .formula_parser import RawRef, parse_formula
 MAX_RANGE_CELLS = 5000
 # 影响面查询的默认上限
 MAX_IMPACT_NODES = 5000
+# 依赖健康审计：扇出（直接引用单元格数）告警的默认阈值
+DEFAULT_FANOUT_THRESHOLD = 20
+# 单条审计问题附带的证据边上限，防止超大区域把响应撑爆
+MAX_AUDIT_EVIDENCE = 100
+
+# 审计问题级别 -> 排序权重（越严重越靠前）
+SEVERITY_WEIGHT = {"error": 0, "warning": 1, "info": 2}
+AUDIT_LEVELS = ("error", "warning", "info")
 
 
 def node_id(sheet: str, coord: str) -> str:
@@ -39,6 +47,27 @@ class SheetInfo:
     formula_count: int = 0
 
 
+@dataclass(frozen=True)
+class MissingSheetRef:
+    """跨表引用指向不存在的工作表（构图时直接跳过，只在此留证）。"""
+
+    source: str        # 公式单元格内部 id
+    formula: str       # 公式原文
+    sheet: str         # 被引用但不存在的工作表名
+    ref_text: str      # 引用原文，如 NoSuch!B2
+
+
+@dataclass(frozen=True)
+class OutOfRangeRef:
+    """显式区域 / 单元格引用超出目标工作表的已用范围。"""
+
+    source: str        # 公式单元格内部 id
+    formula: str       # 公式原文
+    sheet: str         # 目标工作表名
+    ref_text: str      # 引用原文，如 Data!A99:A101
+    coord: str         # 第一个越界坐标（展示用），如 A99
+
+
 @dataclass
 class WorkbookGraph:
     sheets: list[SheetInfo] = field(default_factory=list)
@@ -49,6 +78,8 @@ class WorkbookGraph:
     cycles: list[list[str]] = field(default_factory=list)
     cycle_nodes: set[str] = field(default_factory=set)
     edge_count: int = 0
+    missing_sheet_refs: list[MissingSheetRef] = field(default_factory=list)
+    out_of_range_refs: list[OutOfRangeRef] = field(default_factory=list)
 
     # ------------------------------------------------------------------ 构图
     @classmethod
@@ -81,9 +112,18 @@ class WorkbookGraph:
                     for ref in parse_formula(formula):
                         target_sheet = ref.sheet if ref.sheet is not None else ws.title
                         if target_sheet not in sheet_names:
+                            g.missing_sheet_refs.append(
+                                MissingSheetRef(node, formula, target_sheet, ref.text)
+                            )
                             continue  # 引用不存在的工作表，跳过
                         wst = ws_values.get(target_sheet)
-                        for tcoord in g._expand(ref, bounds[target_sheet]):
+                        coords, out_coord = g._expand(ref, bounds[target_sheet])
+                        if out_coord is not None:
+                            g.out_of_range_refs.append(
+                                OutOfRangeRef(node, formula, target_sheet,
+                                              ref.text, out_coord)
+                            )
+                        for tcoord in coords:
                             tnode = node_id(target_sheet, tcoord)
                             g.precedents.setdefault(node, set()).add(tnode)
                             g.dependents.setdefault(tnode, set()).add(node)
@@ -98,17 +138,30 @@ class WorkbookGraph:
         return g
 
     @staticmethod
-    def _expand(ref: RawRef, bounds: tuple[int, int]) -> list[str]:
-        """把 RawRef 展开为坐标列表。
+    def _expand(
+        ref: RawRef, bounds: tuple[int, int]
+    ) -> tuple[list[str], str | None]:
+        """把 RawRef 展开为 (坐标列表, 第一个越界坐标)。
 
-        显式区域（A1:B10）按原样展开；整行/整列区域按工作表已用范围截断；
+        显式区域（A1:B10）按原样展开；整行/整列区域按工作表已用范围截断
+        （语义上即覆盖全表，越界属正常，不报问题）；显式单元格 / 区域
+        超出已用范围时截断到范围内，并返回越界证据坐标。
         超过 MAX_RANGE_CELLS 时等比收缩，防止内存被打爆。
         """
         max_row, max_col = bounds
+        out_coord: str | None = None
         if ref.kind == "cell":
-            return [f"{get_column_letter(ref.col1)}{ref.row1}"]
+            if ref.row1 <= max_row and ref.col1 <= max_col:
+                return [f"{get_column_letter(ref.col1)}{ref.row1}"], None
+            return [], f"{get_column_letter(ref.col1)}{ref.row1}"
         if ref.kind == "range":
             r1, r2, c1, c2 = ref.row1, ref.row2, ref.col1, ref.col2
+            if r2 > max_row or c2 > max_col:
+                out_coord = f"{get_column_letter(c2)}{r2}"
+                r2, c2 = min(r2, max_row), min(c2, max_col)
+            # 整个区域都在已用范围之外
+            if r1 > r2 or c1 > c2:
+                return [], out_coord
         elif ref.kind == "cols":
             r1, r2 = 1, max_row
             c1, c2 = ref.col1, min(ref.col2, max_col)
@@ -119,11 +172,12 @@ class WorkbookGraph:
             r2 -= 1
         while (r2 - r1 + 1) * (c2 - c1 + 1) > MAX_RANGE_CELLS and c2 > c1:
             c2 -= 1
-        return [
+        coords = [
             f"{get_column_letter(c)}{r}"
             for r in range(r1, r2 + 1)
             for c in range(c1, c2 + 1)
         ]
+        return coords, out_coord
 
     # -------------------------------------------------------------- 环检测
     def _detect_cycles(self) -> None:
@@ -261,6 +315,177 @@ class WorkbookGraph:
             "total": len(items),
         }
 
+    # ------------------------------------------------------ 依赖健康审计
+    def _edge(self, src: str, dst: str | None = None,
+              dst_display: str | None = None, ref: str | None = None) -> dict:
+        e: dict = {
+            "from": src,
+            "from_display": display_id(*split_node(src)) if src else None,
+        }
+        if dst is not None:
+            e["to"] = dst
+        if dst_display is not None:
+            e["to_display"] = dst_display
+        if ref is not None:
+            e["ref"] = ref
+        return e
+
+    def audit(
+        self,
+        levels: tuple[str, ...] = AUDIT_LEVELS,
+        sheet: str | None = None,
+        fanout_threshold: int = DEFAULT_FANOUT_THRESHOLD,
+        evidence_limit: int | None = MAX_AUDIT_EVIDENCE,
+    ) -> dict:
+        """扫描依赖图，生成依赖健康问题清单。
+
+        问题类型：
+          missing_sheet   error   跨表公式指向不存在的工作表
+          empty_ref       warning 被公式引用却为空的单元格
+          out_of_range    warning 引用超出目标工作表的已用范围
+          high_fanout     warning 公式直接引用的单元格数超过阈值
+          orphan_formula  info    未被任何公式引用的公式单元格
+        sheet 筛选按问题所属工作表（缺失工作表类按公式所在工作表）。
+        """
+        issues: list[dict] = []
+
+        def add(issue: dict) -> None:
+            if sheet is not None and issue["sheet"] != sheet:
+                return
+            if issue["level"] not in levels:
+                return
+            ev = issue["evidence"]
+            if evidence_limit is not None and len(ev) > evidence_limit:
+                issue["evidence"] = ev[:evidence_limit]
+                issue["evidence_truncated"] = True
+                issue["evidence_total"] = len(ev)
+            issues.append(issue)
+
+        # 1) 跨表引用指向不存在的工作表（同一公式 / 工作表 / 引用去重）
+        seen: set[tuple] = set()
+        for m in self.missing_sheet_refs:
+            key = (m.source, m.sheet, m.ref_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            add({
+                "code": "missing_sheet",
+                "level": "error",
+                "sheet": split_node(m.source)[0],
+                "cell": m.source,
+                "cell_display": display_id(*split_node(m.source)),
+                "message": f"引用了不存在的工作表 {m.sheet!r}（{m.ref_text}）",
+                "formula": m.formula,
+                "target_sheet": m.sheet,
+                "target_display": m.ref_text,
+                "evidence": [self._edge(m.source, None, m.ref_text, m.ref_text)],
+            })
+
+        # 2) 显式引用超出目标工作表的已用范围
+        seen.clear()
+        for o in self.out_of_range_refs:
+            key = (o.source, o.sheet, o.ref_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            tinfo = next((s for s in self.sheets if s.name == o.sheet), None)
+            target_display = display_id(o.sheet, o.coord)
+            add({
+                "code": "out_of_range",
+                "level": "warning",
+                "sheet": split_node(o.source)[0],
+                "cell": o.source,
+                "cell_display": display_id(*split_node(o.source)),
+                "message": "引用 {ref} 超出工作表「{s}」已用范围"
+                           "（{r} 行 × {c} 列）".format(
+                    ref=o.ref_text, s=o.sheet,
+                    r=tinfo.max_row if tinfo else "?",
+                    c=tinfo.max_col if tinfo else "?"),
+                "formula": o.formula,
+                "target_sheet": o.sheet,
+                "target_display": target_display,
+                "evidence": [
+                    self._edge(o.source, node_id(o.sheet, o.coord),
+                               target_display, o.ref_text)
+                ],
+            })
+
+        # 3) 被公式引用却为空的单元格（无公式、无值；按目标单元格聚合证据边）
+        for target in sorted(self.dependents):
+            if target in self.formulas or target in self.values:
+                continue
+            sources = sorted(self.dependents[target])
+            s_sheet, s_coord = split_node(target)
+            add({
+                "code": "empty_ref",
+                "level": "warning",
+                "sheet": s_sheet,
+                "cell": target,
+                "cell_display": display_id(s_sheet, s_coord),
+                "message": f"单元格 {display_id(s_sheet, s_coord)} 为空，"
+                           f"但被 {len(sources)} 个公式引用",
+                "formula": None,
+                "referenced_by": sources,
+                "evidence": [self._edge(s, target) for s in sources],
+            })
+
+        # 4) 未被任何公式引用的公式单元格（孤立公式）
+        for node in sorted(self.formulas):
+            if self.dependents.get(node):
+                continue
+            n_sheet, n_coord = split_node(node)
+            add({
+                "code": "orphan_formula",
+                "level": "info",
+                "sheet": n_sheet,
+                "cell": node,
+                "cell_display": display_id(n_sheet, n_coord),
+                "message": "该公式未被任何其他公式引用，其结果不参与其他计算",
+                "formula": self.formulas[node],
+                "evidence": [],
+            })
+
+        # 5) 扇出过大的公式节点（直接依赖单元格数 > 阈值）
+        for node in sorted(self.precedents):
+            fanout = len(self.precedents[node])
+            if fanout <= fanout_threshold:
+                continue
+            f_sheet, f_coord = split_node(node)
+            add({
+                "code": "high_fanout",
+                "level": "warning",
+                "sheet": f_sheet,
+                "cell": node,
+                "cell_display": display_id(f_sheet, f_coord),
+                "message": f"直接引用 {fanout} 个单元格，超过扇出阈值 "
+                           f"{fanout_threshold}",
+                "formula": self.formulas[node],
+                "fanout": fanout,
+                "threshold": fanout_threshold,
+                "evidence": [self._edge(node, t)
+                             for t in sorted(self.precedents[node])],
+            })
+
+        issues.sort(key=lambda x: (
+            SEVERITY_WEIGHT[x["level"]], x["code"], x["sheet"], x["cell"]
+        ))
+        counts_by_level = {lv: 0 for lv in AUDIT_LEVELS}
+        counts_by_code: dict[str, int] = {}
+        for it in issues:
+            counts_by_level[it["level"]] += 1
+            counts_by_code[it["code"]] = counts_by_code.get(it["code"], 0) + 1
+        return {
+            "issues": issues,
+            "total": len(issues),
+            "counts_by_level": counts_by_level,
+            "counts_by_code": counts_by_code,
+            "fanout_threshold": fanout_threshold,
+            "filters": {
+                "levels": list(levels),
+                "sheet": sheet,
+            },
+        }
+
     # -------------------------------------------------------------- 汇总
     def summary(self) -> dict:
         return {
@@ -341,4 +566,5 @@ class WorkbookGraph:
             "cycles": [
                 [display_id(*split_node(n)) for n in cyc] for cyc in self.cycles
             ],
+            "audit": self.audit(evidence_limit=None),
         }

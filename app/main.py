@@ -11,7 +11,12 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from openpyxl import load_workbook
 
-from .graph import WorkbookGraph, display_id
+from .graph import (
+    AUDIT_LEVELS,
+    DEFAULT_FANOUT_THRESHOLD,
+    WorkbookGraph,
+    display_id,
+)
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 MAX_WORKBOOKS = 5  # 内存中最多保留的工作簿数量，超出后淘汰最旧的
@@ -19,7 +24,7 @@ MAX_WORKBOOKS = 5  # 内存中最多保留的工作簿数量，超出后淘汰�
 STATIC_DIR = Path(__file__).parent / "static"
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
-app = FastAPI(title="电子表格公式影响分析", version="1.0.0")
+app = FastAPI(title="电子表格公式影响分析", version="1.1.0")
 
 # wid -> {"graph": WorkbookGraph, "filename": str, "ts": float}
 _store: OrderedDict[str, dict] = OrderedDict()
@@ -110,6 +115,66 @@ def workbook_impact(
     result["root_value"] = graph.values.get(node)
     result["root_in_cycle"] = node in graph.cycle_nodes
     return result
+
+
+@app.get("/api/workbooks/{wid}/audit")
+def workbook_audit(
+    wid: str,
+    level: list[str] | None = Query(
+        default=None,
+        description="问题级别筛选，可重复传参：error / warning / info"),
+    sheet: str | None = Query(default=None, description="按工作表筛选"),
+    fanout_threshold: str | None = Query(
+        default=None,
+        description=f"扇出告警阈值，1-10000 的整数，默认 {DEFAULT_FANOUT_THRESHOLD}"),
+):
+    graph = _get(wid)["graph"]
+
+    levels = AUDIT_LEVELS if not level else tuple(dict.fromkeys(level))
+    bad = [lv for lv in levels if lv not in AUDIT_LEVELS]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"level 取值非法: {bad[0]}，仅支持 {list(AUDIT_LEVELS)}")
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+
+    threshold = DEFAULT_FANOUT_THRESHOLD
+    if fanout_threshold is not None:
+        try:
+            threshold = int(fanout_threshold)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="fanout_threshold 必须是 1-10000 的整数") from None
+        if not 1 <= threshold <= 10000:
+            raise HTTPException(
+                status_code=400,
+                detail="fanout_threshold 必须是 1-10000 的整数")
+
+    return {
+        "workbook_id": wid,
+        **graph.audit(levels=levels, sheet=sheet, fanout_threshold=threshold),
+    }
+
+
+@app.get("/api/workbooks/{wid}/audit/export")
+def workbook_audit_export(wid: str):
+    entry = _get(wid)
+    payload = {
+        "workbook_id": wid,
+        "filename": entry["filename"],
+        "audit": entry["graph"].audit(evidence_limit=None),
+    }
+    return JSONResponse(
+        payload,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=dependency_audit_{wid}.json; "
+                f"filename*=UTF-8''dependency_audit_{wid}.json"
+            )
+        },
+    )
 
 
 @app.get("/api/workbooks/{wid}/export")

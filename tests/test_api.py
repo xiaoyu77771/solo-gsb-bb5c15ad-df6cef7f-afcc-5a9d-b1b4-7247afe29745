@@ -79,3 +79,116 @@ def test_bad_upload():
 def test_missing_workbook():
     r = client.get("/api/workbooks/nonexistent")
     assert r.status_code == 404
+
+
+def make_audit_xlsx() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws["A1"] = 1
+    ws["A3"] = "x"                  # 扩展已用范围，使 B1 在范围内但为空
+    ws["C1"] = "=A1+B1"             # B1 空引用
+    ws["C2"] = "=幽灵!A1"           # 缺失工作表
+    ws["C3"] = "=A999"              # 越界
+    ws2 = wb.create_sheet("数据")
+    for i in range(1, 31):
+        ws2.cell(row=i, column=1, value=i)
+    ws["C4"] = "=SUM(数据!A1:A30)"  # 高扇出（30 > 默认阈值 20）
+    ws["C5"] = "=1+1"               # 孤立公式
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_audit_endpoint():
+    r = client.post("/api/upload", files={"file": ("a.xlsx", make_audit_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    wid = r.json()["workbook_id"]
+
+    r = client.get(f"/api/workbooks/{wid}/audit")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["workbook_id"] == wid
+    codes = set(d["counts_by_code"])
+    assert codes == {"missing_sheet", "empty_ref", "out_of_range",
+                     "high_fanout", "orphan_formula"}
+    assert d["fanout_threshold"] == 20
+    # 每条问题的必备字段
+    for it in d["issues"]:
+        assert {"code", "level", "sheet", "cell", "cell_display",
+                "message", "evidence"} <= set(it)
+    # 错误级排在最前
+    assert d["issues"][0]["level"] == "error"
+
+
+def test_audit_filters_and_threshold():
+    r = client.post("/api/upload", files={"file": ("a.xlsx", make_audit_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    wid = r.json()["workbook_id"]
+
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"level": "error"})
+    assert {i["code"] for i in r.json()["issues"]} == {"missing_sheet"}
+
+    r = client.get(f"/api/workbooks/{wid}/audit",
+                   params=[("level", "warning"), ("level", "info")])
+    assert r.json()["filters"]["levels"] == ["warning", "info"]
+
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"sheet": "S1"})
+    assert r.status_code == 200
+    # empty_ref 归属目标单元格 S1!B1；缺失工作表类归属公式所在表 S1
+    assert "missing_sheet" in r.json()["counts_by_code"]
+
+    r = client.get(f"/api/workbooks/{wid}/audit",
+                   params={"fanout_threshold": "100"})
+    assert "high_fanout" not in r.json()["counts_by_code"]
+    r = client.get(f"/api/workbooks/{wid}/audit",
+                   params={"fanout_threshold": "10"})
+    assert "high_fanout" in r.json()["counts_by_code"]
+
+
+def test_audit_bad_params_are_4xx():
+    r = client.post("/api/upload", files={"file": ("a.xlsx", make_audit_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    wid = r.json()["workbook_id"]
+
+    assert client.get(f"/api/workbooks/{wid}/audit",
+                      params={"level": "fatal"}).status_code == 400
+    assert client.get(f"/api/workbooks/{wid}/audit",
+                      params={"fanout_threshold": "abc"}).status_code == 400
+    assert client.get(f"/api/workbooks/{wid}/audit",
+                      params={"fanout_threshold": "0"}).status_code == 400
+    assert client.get(f"/api/workbooks/{wid}/audit",
+                      params={"fanout_threshold": "10001"}).status_code == 400
+    assert client.get(f"/api/workbooks/{wid}/audit",
+                      params={"fanout_threshold": "-3"}).status_code == 400
+    assert client.get(f"/api/workbooks/{wid}/audit",
+                      params={"sheet": "不存在"}).status_code == 404
+
+
+def test_audit_missing_workbook_is_404():
+    assert client.get("/api/workbooks/deadbeefab/audit").status_code == 404
+    assert client.get("/api/workbooks/deadbeefab/audit/export").status_code == 404
+
+
+def test_audit_export():
+    r = client.post("/api/upload", files={"file": ("a.xlsx", make_audit_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    wid = r.json()["workbook_id"]
+    r = client.get(f"/api/workbooks/{wid}/audit/export")
+    assert r.status_code == 200
+    assert "attachment" in r.headers["content-disposition"]
+    assert "dependency_audit_" in r.headers["content-disposition"]
+    d = r.json()
+    assert d["workbook_id"] == wid and d["filename"] == "a.xlsx"
+    assert "issues" in d["audit"] and d["audit"]["total"] > 0
+    # 高扇出证据在导出中不截断
+    fanout = next(i for i in d["audit"]["issues"] if i["code"] == "high_fanout")
+    assert len(fanout["evidence"]) == 30
+
+
+def test_full_export_includes_audit():
+    r = client.post("/api/upload", files={"file": ("a.xlsx", make_audit_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    wid = r.json()["workbook_id"]
+    d = client.get(f"/api/workbooks/{wid}/export").json()
+    assert "audit" in d and "issues" in d["audit"]

@@ -7,6 +7,7 @@
   - 整列引用（=SUM(参数!B:B)）
   - 多级依赖链（参数 -> 计算 -> 汇总 -> 月报）
   - 循环引用（循环!A1 <-> 循环!B1，以及 循环!C1 自环）
+  - 依赖健康审计（审计示例：缺失工作表 / 越界引用 / 空引用 / 高扇出 / 孤立公式）
 """
 from pathlib import Path
 
@@ -78,6 +79,34 @@ def main() -> None:
     ws["B1"] = "=A1+1"
     ws["C1"] = "=C1*2"                     # 自环
     ws["D1"] = "=A1+10"                    # 受循环影响的下游单元格
+
+    # ---- 审计数据表：200 行输入，供高扇出公式引用 ----
+    ws = wb.create_sheet("数据")
+    ws["A1"] = "序号"
+    ws["B1"] = "值"
+    for i in range(1, 201):
+        ws.cell(row=i + 1, column=1, value=i)
+        ws.cell(row=i + 1, column=2, value=i * 1.5)
+
+    # ---- 审计示例表：刻意覆盖全部审计问题类型 ----
+    ws = wb.create_sheet("审计示例")
+    ws["A1"] = "缺失工作表"
+    ws["B1"] = "=不存在的表!A1+1"           # error: missing_sheet
+    ws["A2"] = "越界引用"
+    ws["B2"] = "=数据!B999+1"               # warning: out_of_range
+    ws["A3"] = "空单元格引用"
+    ws["B3"] = "=参数!B8*2"                 # warning: empty_ref（参数表已用至第 7 行，B8 留空）
+    ws["A4"] = "高扇出"
+    ws["B4"] = "=SUM(数据!B2:B201)"         # warning: high_fanout（200 个直接依赖）
+    ws["A5"] = "孤立公式"
+    ws["B5"] = "=1+1"                       # info: orphan_formula
+    ws["A6"] = "正常公式"
+    ws["B6"] = "=参数!B2+1"                 # 引用合法非空
+    ws["A7"] = "正常公式(下游)"
+    ws["B7"] = "=B6*2"                      # 无问题：引用 B6，使 B6 不是孤立公式
+
+    # 参数表追加标签行，使 B8 落在已用范围内；B8 本身留空，供空引用审计演示
+    wb["参数"]["A8"] = "（空值行）"
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     wb.save(OUT)
