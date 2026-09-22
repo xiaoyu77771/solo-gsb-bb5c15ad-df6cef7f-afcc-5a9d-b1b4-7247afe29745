@@ -79,3 +79,116 @@ def test_bad_upload():
 def test_missing_workbook():
     r = client.get("/api/workbooks/nonexistent")
     assert r.status_code == 404
+
+
+# ------------------------------------------------------------ 依赖健康审计
+def make_audit_xlsx() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws["A1"] = 3
+    ws["B1"] = "=A1*2"
+    ws["B2"] = "=Ghost!A1"          # 引用不存在的工作表
+    ws["B3"] = "=S2!Z99"            # 跨表超出已用范围
+    ws["B4"] = "=SUM(A1:A2)"        # A2 空引用；扇出 2
+    ws2 = wb.create_sheet("S2")
+    ws2["A1"] = 1
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def upload_audit():
+    r = client.post(
+        "/api/upload",
+        files={"file": ("a.xlsx", make_audit_xlsx(),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert r.status_code == 200
+    return r.json()["workbook_id"]
+
+
+def test_audit_full_result():
+    wid = upload_audit()
+    r = client.get(f"/api/workbooks/{wid}/audit")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["workbook_id"] == wid
+    assert d["fanout_threshold"] == 50
+    assert set(d["counts"]) == {"error", "warning", "info", "all"}
+    assert d["counts"]["error"] >= 1
+    types = {i["type"] for i in d["issues"]}
+    assert {"missing_sheet", "out_of_sheet_range", "empty_reference", "orphan_formula"} <= types
+    miss = next(i for i in d["issues"] if i["type"] == "missing_sheet")
+    assert miss["level"] == "error" and miss["cell"] == "S1!B2"
+    assert miss["evidence"][0]["missing_sheet"] == "Ghost"
+    oor = next(i for i in d["issues"] if i["type"] == "out_of_sheet_range")
+    assert oor["level"] == "warning" and oor["cell"] == "S1!B3"
+
+
+def test_audit_filter_level_and_sheet():
+    wid = upload_audit()
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"level": "error"})
+    d = r.json()
+    assert all(i["level"] == "error" for i in d["issues"])
+    # 汇总计数仍是全量的
+    assert d["counts"]["all"] >= len(d["issues"])
+
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"sheet": "S2"})
+    assert r.status_code == 200
+    assert all(i["sheet"] == "S2" for i in r.json()["issues"])
+
+
+def test_audit_fanout_threshold():
+    wid = upload_audit()
+    # B4 扇出 2：阈值 2 起报
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"fanout_threshold": 2})
+    assert r.status_code == 200
+    cells = {i["cell"] for i in r.json()["issues"] if i["type"] == "high_fanout"}
+    assert "S1!B4" in cells
+    # 默认阈值 50 不报
+    r = client.get(f"/api/workbooks/{wid}/audit")
+    cells = {i["cell"] for i in r.json()["issues"] if i["type"] == "high_fanout"}
+    assert cells == set()
+
+
+def test_audit_bad_params():
+    wid = upload_audit()
+    # 非数字阈值 -> 400
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"fanout_threshold": "abc"})
+    assert r.status_code == 400 and "fanout_threshold" in r.json()["detail"]
+    # 越界阈值 -> 400
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"fanout_threshold": 0})
+    assert r.status_code == 400
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"fanout_threshold": -5})
+    assert r.status_code == 400
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"fanout_threshold": 100001})
+    assert r.status_code == 400
+    # 非法级别 -> 400
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"level": "fatal"})
+    assert r.status_code == 400 and "level" in r.json()["detail"]
+    # 不存在的工作表 -> 404
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"sheet": "Nope"})
+    assert r.status_code == 404
+
+
+def test_audit_missing_workbook():
+    r = client.get("/api/workbooks/nonexistent/audit")
+    assert r.status_code == 404
+
+
+def test_audit_download_json():
+    wid = upload_audit()
+    r = client.get(f"/api/workbooks/{wid}/audit", params={"download": "true"})
+    assert r.status_code == 200
+    assert "attachment" in r.headers["content-disposition"]
+    assert "dependency_audit_" in r.headers["content-disposition"]
+    d = r.json()
+    assert d["workbook_id"] == wid and "issues" in d
+
+
+def test_audit_page_has_panel():
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "依赖健康审计" in r.text
+    assert "/audit" in r.text

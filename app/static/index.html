@@ -80,6 +80,35 @@
   .toast { position: fixed; top: 16px; right: 16px; background: #7f1d1d; color: #fecaca;
            padding: 10px 16px; border-radius: 8px; display: none; z-index: 9; max-width: 420px; }
   .muted { color: var(--muted); }
+  /* ---------------- 审计面板 ---------------- */
+  #auditPanel { display: none; position: fixed; inset: 53px 0 0 0; background: var(--bg);
+                z-index: 8; flex-direction: column; }
+  #auditPanel.show { display: flex; }
+  #auditBar { display: flex; gap: 10px; align-items: center; padding: 10px 20px;
+              background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  #auditBar select, #auditBar input { width: auto; min-width: 140px; }
+  #auditBar input[type=number] { width: 90px; }
+  .a-chip { background: var(--chip); border: 1px solid var(--border); border-radius: 16px;
+            padding: 4px 13px; cursor: pointer; font-size: 13px; user-select: none; }
+  .a-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .a-chip .n { font-weight: 600; margin-left: 4px; }
+  .a-chip.lv-error .n { color: #fca5a5; }
+  .a-chip.lv-warning .n { color: #fcd34d; }
+  .a-chip.lv-info .n { color: #93c5fd; }
+  .a-chip.active .n { color: #fff; }
+  #auditTableWrap { overflow: auto; flex: 1; padding: 0 20px 20px; }
+  #auditTable th { top: 0; background: var(--panel); z-index: 1; }
+  .lvl { display: inline-block; border-radius: 4px; padding: 1px 7px; font-size: 11px; white-space: nowrap; }
+  .lvl-error { background: #7f1d1d; color: #fecaca; }
+  .lvl-warning { background: #78350f; color: #fde68a; }
+  .lvl-info { background: #1e3a5f; color: #bfdbfe; }
+  .tag { display: inline-block; background: var(--chip); border-radius: 4px; padding: 1px 7px;
+         font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .ev { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted);
+        line-height: 1.9; }
+  .ev a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .ev a:hover { text-decoration: underline; }
+  #auditEmpty { color: var(--muted); text-align: center; padding: 60px; }
 </style>
 </head>
 <body>
@@ -87,6 +116,7 @@
   <h1>📊 电子表格公式影响分析</h1>
   <span id="fname" class="muted"></span>
   <button class="btn ghost" id="exportBtn" disabled>导出分析 JSON</button>
+  <button class="btn ghost" id="auditBtn" disabled>🩺 依赖健康审计</button>
   <button class="btn" id="uploadBtn">上传 XLSX</button>
   <input type="file" id="fileInput" accept=".xlsx,.xlsm" hidden>
 </header>
@@ -143,6 +173,33 @@
     </div>
   </div>
 </main>
+
+<div id="auditPanel">
+  <div id="auditBar">
+    <button class="btn ghost" id="auditClose">← 返回分析</button>
+    <span class="a-chip active" data-lvl="">全部<span class="n" id="acAll">0</span></span>
+    <span class="a-chip lv-error" data-lvl="error">错误<span class="n" id="acError">0</span></span>
+    <span class="a-chip lv-warning" data-lvl="warning">警告<span class="n" id="acWarn">0</span></span>
+    <span class="a-chip lv-info" data-lvl="info">提示<span class="n" id="acInfo">0</span></span>
+    <select id="auditSheet"><option value="">全部工作表</option></select>
+    <label class="muted" style="font-size:12px">扇出阈值
+      <input type="number" id="auditFanout" min="1" max="100000" value="50" style="margin-left:4px">
+    </label>
+    <span style="flex:1"></span>
+    <button class="btn ghost" id="auditExport">导出审计 JSON</button>
+  </div>
+  <div id="auditTableWrap">
+    <table id="auditTable">
+      <thead><tr>
+        <th style="width:56px">级别</th><th style="width:150px">类型</th>
+        <th style="width:200px">单元格</th><th>问题说明</th><th style="width:34%">证据边</th>
+      </tr></thead>
+      <tbody id="auditRows"></tbody>
+    </table>
+    <div id="auditEmpty">未发现匹配的问题 🎉</div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -195,6 +252,7 @@ function onUploaded(d) {
   $('stEdges').textContent = d.edge_count;
   $('stCycles').textContent = d.cycle_count;
   $('exportBtn').disabled = false;
+  $('auditBtn').disabled = false;
 
   const sel = $('sheetSelect');
   sel.innerHTML = '<option value="">全部工作表</option>' +
@@ -208,6 +266,13 @@ function onUploaded(d) {
         c.map(n => `<a class="link js-cell" data-cell="${esc(n)}">${esc(n)}</a>`).join(' → ') +
         ` → ${esc(c[0])}</div>`).join('');
   } else { cp.style.display = 'none'; cp.innerHTML = ''; }
+  // 重置审计面板，避免新工作簿沿用上一个文件的筛选 / 面板状态
+  closeAudit();
+  AUDIT_LEVEL = '';
+  document.querySelectorAll('#auditBar .a-chip').forEach((x, i) =>
+    x.classList.toggle('active', i === 0));
+  $('auditSheet').innerHTML = '<option value="">全部工作表</option>';
+  $('auditFanout').value = 50;
   loadCells();
 }
 
@@ -290,6 +355,102 @@ async function loadImpact(cell) {
 
 // ---------------- 导出 ----------------
 $('exportBtn').onclick = () => { if (WID) window.location = `/api/workbooks/${WID}/export`; };
+
+// ---------------- 依赖健康审计 ----------------
+let AUDIT_LEVEL = '', AUDIT_OPEN = false;
+
+$('auditBtn').onclick = openAudit;
+$('auditClose').onclick = closeAudit;
+
+function openAudit() {
+  if (!WID) return;
+  AUDIT_OPEN = true;
+  $('auditPanel').classList.add('show');
+  // 工作表筛选复用单元格列表的工作表清单（保留“全部工作表”选项）
+  const savedSheet = $('auditSheet').value;
+  $('auditSheet').innerHTML = $('sheetSelect').innerHTML;
+  $('auditSheet').value = savedSheet;
+  loadAudit();
+}
+
+function closeAudit() {
+  AUDIT_OPEN = false;
+  $('auditPanel').classList.remove('show');
+}
+
+document.querySelectorAll('#auditBar .a-chip').forEach(ch => ch.onclick = () => {
+  document.querySelectorAll('#auditBar .a-chip').forEach(x => x.classList.remove('active'));
+  ch.classList.add('active');
+  AUDIT_LEVEL = ch.dataset.lvl;
+  loadAudit();
+});
+$('auditSheet').onchange = loadAudit;
+$('auditFanout').onchange = loadAudit;
+$('auditExport').onclick = () => {
+  if (!WID) return;
+  const p = new URLSearchParams({
+    download: '1', fanout_threshold: $('auditFanout').value || '50',
+  });
+  if ($('auditSheet').value) p.set('sheet', $('auditSheet').value);
+  if (AUDIT_LEVEL) p.set('level', AUDIT_LEVEL);
+  window.location = `/api/workbooks/${WID}/audit?` + p;
+};
+
+async function loadAudit() {
+  if (!WID || !AUDIT_OPEN) return;
+  const p = new URLSearchParams({ fanout_threshold: $('auditFanout').value || '50' });
+  if ($('auditSheet').value) p.set('sheet', $('auditSheet').value);
+  if (AUDIT_LEVEL) p.set('level', AUDIT_LEVEL);
+  const r = await fetch(`/api/workbooks/${WID}/audit?` + p);
+  const d = await r.json();
+  if (!r.ok) { toast(d.detail || '审计失败'); return; }
+  $('acAll').textContent = d.counts.all;
+  $('acError').textContent = d.counts.error;
+  $('acWarn').textContent = d.counts.warning;
+  $('acInfo').textContent = d.counts.info;
+  $('auditEmpty').style.display = d.issues.length ? 'none' : 'block';
+  $('auditRows').innerHTML = d.issues.map(it => `
+    <tr>
+      <td><span class="lvl lvl-${it.level}">${esc(levelText(it.level))}</span></td>
+      <td><span class="tag">${esc(it.type_label)}</span></td>
+      <td class="mono"><a class="link js-audit-cell" data-cell="${esc(it.cell_display)}">${esc(it.cell_display)}</a></td>
+      <td>${esc(it.message)}</td>
+      <td class="ev">${renderEvidence(it)}</td>
+    </tr>`).join('');
+}
+
+const levelText = lv => ({error: '错误', warning: '警告', info: '提示'}[lv] || lv);
+
+function renderEvidence(it) {
+  if (!it.evidence || !it.evidence.length) return '<span class="muted">—</span>';
+  const parts = it.evidence.map(e => {
+    const from = `<a class="js-audit-cell" data-cell="${esc(e.from)}">${esc(e.from)}</a>`;
+    const to = e.missing_sheet
+      ? `<span title="工作表不存在">${esc(e.to)} ⚠</span>`
+      : `<a class="js-audit-cell" data-cell="${esc(e.to)}">${esc(e.to)}</a>`;
+    return `${from} → ${to}`;
+  });
+  const more = it.evidence_total > it.evidence.length
+    ? `<span class="muted">… 共 ${it.evidence_total} 条，仅展示前 ${it.evidence.length} 条</span>` : '';
+  return parts.join('<br>') + (more ? '<br>' + more : '');
+}
+
+// 证据边 / 问题位置跳转：展示 id（可能带引号）归一化为内部 id 后复用影响面视图
+function toInternalId(display) {
+  let s = display;
+  if (s.startsWith("'") && s.includes("'!")) {
+    s = s.slice(1).replace("'!", "!", 1);
+  }
+  return s;
+}
+
+document.addEventListener('click', e => {
+  const el = e.target.closest('.js-audit-cell');
+  if (el && WID) {
+    closeAudit();
+    selectCell(toInternalId(el.dataset.cell));
+  }
+});
 </script>
 </body>
 </html>

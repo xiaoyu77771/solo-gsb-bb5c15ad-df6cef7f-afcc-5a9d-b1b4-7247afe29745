@@ -11,6 +11,13 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from openpyxl import load_workbook
 
+from .audit import (
+    DEFAULT_FANOUT_THRESHOLD,
+    FANOUT_MAX,
+    FANOUT_MIN,
+    LEVELS,
+    audit_graph,
+)
 from .graph import WorkbookGraph, display_id
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
@@ -110,6 +117,57 @@ def workbook_impact(
     result["root_value"] = graph.values.get(node)
     result["root_in_cycle"] = node in graph.cycle_nodes
     return result
+
+
+@app.get("/api/workbooks/{wid}/audit")
+def workbook_audit(
+    wid: str,
+    level: str | None = Query(default=None, description="按级别筛选：error / warning / info"),
+    sheet: str | None = Query(default=None, description="按工作表名筛选"),
+    fanout_threshold: str = Query(
+        default=str(DEFAULT_FANOUT_THRESHOLD),
+        description=f"扇出阈值（整数，{FANOUT_MIN}~{FANOUT_MAX}），默认 {DEFAULT_FANOUT_THRESHOLD}",
+    ),
+    download: bool = Query(default=False, description="为 true 时以附件形式下载 JSON"),
+):
+    entry = _get(wid)
+    try:
+        threshold = int(fanout_threshold)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"fanout_threshold 必须是 {FANOUT_MIN}~{FANOUT_MAX} 之间的整数",
+        )
+    if not FANOUT_MIN <= threshold <= FANOUT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"fanout_threshold 必须是 {FANOUT_MIN}~{FANOUT_MAX} 之间的整数",
+        )
+    if level is not None and level not in LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"level 取值非法，应为：{', '.join(LEVELS)}",
+        )
+    if sheet is not None and sheet not in {s.name for s in entry["graph"].sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+
+    result = audit_graph(entry["graph"], fanout_threshold=threshold, sheet=sheet, level=level)
+    payload = {
+        "workbook_id": wid,
+        "filename": entry["filename"],
+        **result,
+    }
+    if not download:
+        return payload
+    return JSONResponse(
+        payload,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=dependency_audit_{wid}.json; "
+                f"filename*=UTF-8''dependency_audit_{wid}.json"
+            )
+        },
+    )
 
 
 @app.get("/api/workbooks/{wid}/export")

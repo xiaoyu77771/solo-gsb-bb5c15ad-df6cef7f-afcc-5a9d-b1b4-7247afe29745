@@ -79,6 +79,33 @@ def main() -> None:
     ws["C1"] = "=C1*2"                     # 自环
     ws["D1"] = "=A1+10"                    # 受循环影响的下游单元格
 
+    # ---- 审计数据：50 个输入格（B2:B51），C3 故意留空 ----
+    ws = wb.create_sheet("审计数据")
+    ws["A1"] = "序号"
+    ws["B1"] = "数值"
+    ws["C1"] = "备注（C3 留空演示空引用）"   # 让 C 列进入已用范围
+    for i in range(2, 52):
+        ws.cell(row=i, column=1, value=i - 1)
+        ws.cell(row=i, column=2, value=i)
+    # C3 在已用范围内但无内容，用于“被引用却为空（范围内）”演示
+
+    # ---- 审计示例：集中触发依赖健康审计的各类问题 ----
+    ws = wb.create_sheet("审计示例")
+    ws["A1"] = "孤立公式（结果没人用）"
+    ws["B1"] = "=1+1"                                   # orphan_formula
+    ws["A2"] = "引用本表空单元格"
+    ws["B2"] = "=D2*2"                                  # empty_reference（同表越界空格）
+    ws["A3"] = "引用范围内空格(审计数据!C3)"
+    ws["B3"] = "=审计数据!C3+1"                         # empty_reference（跨表、范围内）
+    ws["A4"] = "引用已删除工作表"
+    ws["B4"] = "=#REF!+不存在的表!A1"                   # missing_sheet（#REF! 字面量忽略）
+    ws["A5"] = "跨表单格超已用范围"
+    ws["B5"] = "=审计数据!H2"                           # out_of_sheet_range
+    ws["A6"] = "跨表区域超已用范围"
+    ws["B6"] = "=SUM(审计数据!B45:B60)"                 # out_of_sheet_range + 扇出 16
+    ws["A7"] = "扇出过大（50 个单元格，默认阈值 50 起报）"
+    ws["B7"] = "=SUM(审计数据!B2:B51)"                  # high_fanout（阈值 50）
+
     OUT.parent.mkdir(parents=True, exist_ok=True)
     wb.save(OUT)
     print(f"已生成 {OUT}")

@@ -46,6 +46,7 @@ class WorkbookGraph:
     values: dict[str, str] = field(default_factory=dict)        # node -> 缓存计算值
     precedents: dict[str, set[str]] = field(default_factory=dict)  # node -> 它引用的节点
     dependents: dict[str, set[str]] = field(default_factory=dict)  # node -> 引用它的节点
+    raw_refs: dict[str, list[RawRef]] = field(default_factory=dict)  # 公式节点 -> 未展开引用（含指向不存在工作表的）
     cycles: list[list[str]] = field(default_factory=list)
     cycle_nodes: set[str] = field(default_factory=set)
     edge_count: int = 0
@@ -74,11 +75,14 @@ class WorkbookGraph:
                     node = node_id(ws.title, coord)
                     g.formulas[node] = formula
                     info.formula_count += 1
+                    refs = parse_formula(formula)
+                    if refs:
+                        g.raw_refs[node] = refs
                     if wsv is not None:
                         v = wsv[coord].value
                         if v is not None:
                             g.values[node] = str(v)
-                    for ref in parse_formula(formula):
+                    for ref in refs:
                         target_sheet = ref.sheet if ref.sheet is not None else ws.title
                         if target_sheet not in sheet_names:
                             continue  # 引用不存在的工作表，跳过
